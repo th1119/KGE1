@@ -7,6 +7,7 @@ import torch
 import itertools
 from models import KBCModel
 
+
 class Dataset(object):
     def __init__(self, data_path: str, name: str):
         self.root = os.path.join(data_path, name)
@@ -26,20 +27,20 @@ class Dataset(object):
         inp_f = open(os.path.join(self.root, 'to_skip.pickle'), 'rb')
         self.to_skip: Dict[str, Dict[Tuple[int, int], List[int]]] = pickle.load(inp_f)
         inp_f.close()
-        
+
         self.table = {}
         self.nums = {}
         self.neighbors = {}
         self.neighbors_addition = {}
         self.start = 0
         self.end = 5
-        
-        #self.get_table()
-        #self.get_neighbors()
-        #self.get_nums()
-        #self.fix_neighbors()
+
+        # self.get_table()
+        # self.get_neighbors()
+        # self.get_nums()
+        # self.fix_neighbors()
         # self.random_fix_neighbors()
-        #self.addition_neighbors()
+        # self.addition_neighbors()
         self.neighbors, self.neighbors_addition = self.new_get_neighbor()
 
     def get_weight(self):
@@ -63,8 +64,96 @@ class Dataset(object):
         copy[:, 2] = tmp
         copy[:, 1] += self.n_predicates // 2  # has been multiplied by two.
         return np.vstack((self.data['train'], copy))
-    
-    def new_get_neighbor(self, ):
+
+    def new_get_neighbor(self):
+        table = {}
+        for split in ["train", "test", "valid"]:
+            coo_dict = {}
+            for triple in self.data[split]:
+                h, r, t = triple[0].item(), triple[1].item(), triple[2].item()
+                coo_dict[(h, t)] = r
+
+            rows, cols, vals = [], [], []
+            for (h, t), r in coo_dict.items():
+                rows.append(h)
+                cols.append(t)
+                vals.append(r)
+
+            indices = torch.tensor([rows, cols], dtype=torch.long)
+            values = torch.tensor(vals, dtype=torch.int64)
+            table[split] = torch.sparse_coo_tensor(
+                indices, values,
+                (self.n_entities, self.n_entities),
+                dtype=torch.int64
+            ).coalesce()
+
+        neighbors = {}
+        sample_num = self.end - self.start
+
+        for split in ["train", "test", "valid"]:
+            index_rel = []
+            sparse_tensor = table[split]
+            indices = sparse_tensor.indices()
+            values = sparse_tensor.values()
+
+            adj_list = [[] for _ in range(self.n_entities)]
+            for idx in range(indices.size(1)):
+                h = indices[0, idx].item()
+                t = indices[1, idx].item()
+                r = values[idx].item()
+                adj_list[h].append((t, r))
+
+            for i in range(self.n_entities):
+
+                neighbors_i = adj_list[i]
+
+                if len(neighbors_i) > 0:
+                    t_vals = torch.tensor([t for t, _ in neighbors_i], dtype=torch.long)
+                    r_vals = torch.tensor([r for _, r in neighbors_i], dtype=torch.int64)
+                    nonzero_indices = t_vals.view(-1, 1)
+                    num_nonzero = nonzero_indices.size(0)
+                else:
+                    nonzero_indices = torch.empty((0, 1), dtype=torch.long)
+                    r_vals = torch.empty((0,), dtype=torch.int64)
+                    num_nonzero = 0
+
+                if num_nonzero >= sample_num:
+
+                    perm = torch.randperm(num_nonzero)[:sample_num]
+                    selected_indices = nonzero_indices[perm]
+                    selected_rels = r_vals[perm].view(-1, 1)
+                    entry = torch.cat([selected_indices, selected_rels], dim=1)
+                else:
+
+                    if num_nonzero > 0:
+                        existing = torch.cat([
+                            nonzero_indices,
+                            r_vals.view(-1, 1)
+                        ], dim=1)
+                    else:
+                        existing = torch.empty((0, 2), dtype=torch.int64)
+
+                    num_pad = sample_num - num_nonzero
+                    pad_tensor = torch.tensor(
+                        [[i, self.n_predicates]] * num_pad,
+                        dtype=torch.int64
+                    )
+                    entry = torch.cat([existing, pad_tensor], dim=0)
+
+                index_rel.append(entry)
+
+            neighbors[split] = torch.stack(index_rel, dim=0)
+
+        neighbors_addition = {}
+        for split in ["train", "test", "valid"]:
+            tmp_node = neighbors[split][:, self.start:self.end, 0]
+            tmp = [torch.tensor(list(itertools.permutations(batch))) for batch in tmp_node]
+            tmp_ = [torch.unsqueeze(torch.cat(list(p)), dim=0) for p in tmp]
+            neighbors_addition[split] = torch.cat(tmp_, dim=0)
+
+        return neighbors, neighbors_addition
+
+    def new_get_neighbor_(self, ):
         table = {}
         for split in ["train", "test", "valid"]:
             table[split] = torch.zeros([self.n_entities, self.n_entities], dtype=torch.int64)
@@ -83,7 +172,8 @@ class Dataset(object):
                     index_rel.append(torch.cat([unique_elements, non_zero_rel], dim=1))
                 else:
                     non_zero_rel = table[split][i][nonzero_indices]
-                    tmp_list = torch.tensor([[i, self.n_predicates] for _ in range(sample_num - nonzero_indices.size(0))])
+                    tmp_list = torch.tensor(
+                        [[i, self.n_predicates] for _ in range(sample_num - nonzero_indices.size(0))])
                     index_rel.append(torch.cat([torch.cat([nonzero_indices, non_zero_rel], dim=1), tmp_list], dim=0))
             neighbors[split] = torch.stack(index_rel, dim=0)
         neighbors_addition = {}
@@ -93,9 +183,9 @@ class Dataset(object):
             tmp = [f(_) for _ in tmp_node]
             tmp_ = [torch.unsqueeze(torch.cat([i for i in _], dim=0), dim=0) for _ in tmp]
             neighbors_addition[split] = torch.cat(tmp_, dim=0)
-            
+
         return neighbors, neighbors_addition
-    
+
     def get_table(self, ):
         for split in ["train", "test", "valid"]:
             self.table[split] = torch.zeros([self.n_entities, self.n_entities], dtype=torch.int64)
@@ -120,23 +210,27 @@ class Dataset(object):
         for split in ["train", "test", "valid"]:
             for j in range(len(self.neighbors[split])):
                 if len(self.neighbors[split][j]) < self.nums[split]:
-                    additional_data = torch.tensor([[j, self.n_predicates] for _ in range(self.nums[split]-len(self.neighbors[split][j]))])
+                    additional_data = torch.tensor(
+                        [[j, self.n_predicates] for _ in range(self.nums[split] - len(self.neighbors[split][j]))])
                     self.neighbors[split][j] = torch.cat([self.neighbors[split][j], additional_data], dim=0)
             self.neighbors[split] = torch.tensor([n.tolist() for n in self.neighbors[split]])
-            
+
     def random_fix_neighbors(self, mode=1):
-        n_l = [1428.,18998.,30874.,36207.,38471.]
+        n_l = [1428., 18998., 30874., 36207., 38471.]
         n_l = torch.tensor([_l / 40943. for _l in n_l])
-        ran = torch.rand(len(self.neighbors["train"]),1)
+        ran = torch.rand(len(self.neighbors["train"]), 1)
         logits = torch.gt(ran, n_l)
         for split in ["train", "test", "valid"]:
             for j in range(len(self.neighbors[split])):
                 if len(self.neighbors[split][j]) < self.nums[split]:
-                    additional_data = torch.tensor([[j, self.n_predicates] for _ in range(self.nums[split]-len(self.neighbors[split][j]))])
+                    additional_data = torch.tensor(
+                        [[j, self.n_predicates] for _ in range(self.nums[split] - len(self.neighbors[split][j]))])
                     self.neighbors[split][j] = torch.cat([self.neighbors[split][j], additional_data], dim=0)
                 if mode == 1:
                     self.neighbors[split][j] = self.neighbors[split][j].tolist()
-                    self.neighbors[split][j][self.start:self.end] = [self.neighbors[split][j][_] if logits[j][_] else [j, self.n_predicates] for _ in range(self.start,self.end)]
+                    self.neighbors[split][j][self.start:self.end] = [
+                        self.neighbors[split][j][_] if logits[j][_] else [j, self.n_predicates] for _ in
+                        range(self.start, self.end)]
                     self.neighbors[split][j] = torch.tensor(self.neighbors[split][j])
             self.neighbors[split] = torch.tensor([n.tolist() for n in self.neighbors[split]])
 
@@ -174,7 +268,8 @@ class Dataset(object):
                 q[:, 2] = tmp
                 q[:, 1] += self.n_predicates // 2
             # ranks = model.get_ranking(q, self.to_skip[m], batch_size=500)
-            ranks = model.get_ranking(q, self.neighbors[split], self.neighbors_addition[split], self.to_skip[m], batch_size=500)
+            ranks = model.get_ranking(q, self.neighbors[split], self.neighbors_addition[split], self.to_skip[m],
+                                      batch_size=500)
 
             if log_result:
                 if not flag:
@@ -183,7 +278,8 @@ class Dataset(object):
                     flag = True
                 else:
                     results = np.concatenate((results, np.concatenate((q.cpu().detach().numpy(),
-                                              np.expand_dims(ranks.cpu().detach().numpy(), axis=1)), axis=1)), axis=0)
+                                                                       np.expand_dims(ranks.cpu().detach().numpy(),
+                                                                                      axis=1)), axis=1)), axis=0)
 
             mean_reciprocal_rank[m] = torch.mean(1. / ranks).item()
             hits_at[m] = torch.FloatTensor((list(map(
